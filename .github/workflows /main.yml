@@ -1,0 +1,321 @@
+name: MinGW Build & Release (qemu-simulide)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Versão/Tag (ex.: v0.1.0)"
+        required: true
+        type: string
+      prerelease:
+        description: "Marcar como pré-release?"
+        required: false
+        default: false
+        type: boolean
+      notes:
+        description: "Notas da release (opcional)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+
+    env:
+      ZIP_NAME: qemu-simulide-windows-mingw64-${{ inputs.version }}.zip
+
+    steps:
+
+      # -------------------------------------------------------------------
+      # Long paths
+      # -------------------------------------------------------------------
+      - name: Habilitar long paths no Git
+        run: |
+          git config --system core.longpaths true
+          git config --global core.longpaths true
+
+      # -------------------------------------------------------------------
+      # Checkout
+      # -------------------------------------------------------------------
+      - name: Checkout (sem submódulos)
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+          persist-credentials: true
+
+      # -------------------------------------------------------------------
+      # MSYS2 + MinGW64
+      # -------------------------------------------------------------------
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            base-devel
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-pixman
+            mingw-w64-x86_64-libgcrypt
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-capstone
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ntldd
+            mingw-w64-x86_64-bzip2
+            mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-openssl
+
+      # -------------------------------------------------------------------
+      # Versions info
+      # -------------------------------------------------------------------
+      - name: Versões das ferramentas
+        shell: msys2 {0}
+        run: |
+          which gcc && gcc --version
+          which g++ && g++ --version
+          which python3 && python3 --version
+          which meson && meson --version
+          which ninja && ninja --version
+
+      # -------------------------------------------------------------------
+      # Clear environment
+      # -------------------------------------------------------------------
+      - name: Limpar variáveis
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          for v in QEMU_CONFIGURE_OPTS QEMU_CONFIGURE_FLAGS CONFIGURE_OPTS CONFIGURE_FLAGS CPPFLAGS CFLAGS CXXFLAGS LDFLAGS; do
+            unset "$v" || true
+          done
+          rm -rf build config.log || true
+
+      # -------------------------------------------------------------------
+      # Stub libs
+      # -------------------------------------------------------------------
+      - name: Criar ci_shims
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p ci_shims
+          cat > ci_shims/ci_shims.c << 'EOF'
+          #include <stdint.h>
+          void stm32_f103c8_uart_action(void) {}
+          void stm32_f103c8_timer_action(void) {}
+          void stm32_uart_action(int port, uint8_t value) {}
+          void stm32_gpio_in_action(int pin, uint8_t value) {}
+          EOF
+          gcc -c ci_shims/ci_shims.c -o ci_shims/ci_shims.o
+          ar rcs ci_shims/libci_shims.a ci_shims/ci_shims.o
+
+      # -------------------------------------------------------------------
+      # Patch simuliface
+      # -------------------------------------------------------------------
+      - name: Patch simuliface.h (action/time)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          python3 - << 'EOF'
+          import os
+          path = "system/simuliface.h"
+          txt = open(path).read()
+          if "ARENA_COMPAT_ACTION_FIELD" in txt:
+              raise SystemExit(0)
+          insertion = r"""
+          #ifndef ARENA_COMPAT_ACTION_FIELD
+          #define ARENA_COMPAT_ACTION_FIELD qemuAction
+          #endif
+          #ifndef ARENA_COMPAT_TIME_FIELD
+          #define ARENA_COMPAT_TIME_FIELD   qemuTime
+          #endif
+          #define action ARENA_COMPAT_ACTION_FIELD
+          #define time   ARENA_COMPAT_TIME_FIELD
+          """
+          idx = txt.rfind("#endif")
+          if idx == -1:
+              txt += insertion
+          else:
+              txt = txt[:idx] + insertion + txt[idx:]
+          open(path, "w").write(txt)
+          EOF
+
+      # -------------------------------------------------------------------
+      # Patch SafeStack
+      # -------------------------------------------------------------------
+      - name: Patch SafeStack
+        shell: msys2 {0}
+        run: |
+          python3 - << 'EOF'
+          path = "meson.build"
+          txt = open(path).read()
+          old = "error('Problem encountered: Cannot disable SafeStack')"
+          if old in txt:
+              txt = txt.replace(old, "message('SafeStack ignored on MinGW')")
+              open(path, "w").write(txt)
+          EOF
+
+      # -------------------------------------------------------------------
+      # Patch QGA VSS
+      # -------------------------------------------------------------------
+      - name: Patch QGA VSS
+        shell: msys2 {0}
+        run: |
+          python3 - << 'EOF'
+          import os
+          path = "qga/meson.build"
+          if not os.path.exists(path):
+              raise SystemExit(0)
+          txt = open(path, "r", encoding="utf-8").read()
+          if "subdir('vss-win32')" in txt:
+              txt = txt.replace(
+                  "subdir('vss-win32')",
+                  "message('Skipping qga/vss-win32 (ConvertStringToBSTR conflict)')\n# subdir('vss-win32')"
+              )
+              open(path, "w", encoding="utf-8").write(txt)
+          EOF
+
+      # -------------------------------------------------------------------
+      # Build libslirp
+      # -------------------------------------------------------------------
+      - name: Build libslirp
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          if [ ! -d slirp_src ]; then
+            git clone https://gitlab.freedesktop.org/slirp/libslirp.git slirp_src
+          fi
+          cd slirp_src
+
+          # Configura o build em slirp_src/builddir
+          meson setup builddir --prefix=/mingw64 \
+            || meson setup builddir --prefix=/mingw64 --reconfigure
+
+          # COMPILA dentro de builddir (não é "build"!)
+          ninja -C builddir
+
+          # Instala no prefix /mingw64 usado pelo QEMU
+          ninja -C builddir install
+      # -------------------------------------------------------------------
+      # Configure QEMU (AGORA CORRETO)
+      # -------------------------------------------------------------------
+      - name: Configure QEMU
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir build
+          cd build
+
+          export CFLAGS="-D_LIBCPP_VERSION=0"
+          export CXXFLAGS="-D_LIBCPP_VERSION=0"
+
+          EXTRA_LDFLAGS="$(cygpath -m "$PWD/../ci_shims/libci_shims.a")"
+
+          ../configure \
+            --prefix=/mingw64 \
+            --target-list=xtensa-softmmu \
+            --disable-werror \
+            --enable-slirp \
+            --enable-sdl \
+            --enable-capstone \
+            --extra-ldflags="$EXTRA_LDFLAGS"
+
+      # -------------------------------------------------------------------
+      # Build QEMU
+      # -------------------------------------------------------------------
+      - name: Build QEMU
+        shell: msys2 {0}
+        env:
+          NINJA_STATUS: "[%f/%t %o/sec] "
+        run: |
+          set -euo pipefail
+          mkdir -p build/_ci_logs
+          ninja -C build qemu-system-xtensa.exe qemu-system-xtensaw.exe -v \
+            1> >(tee build/_ci_logs/_ci_stdout.log) \
+            2> >(tee build/_ci_logs/_ci_stderr.log >&2)
+
+
+      # -------------------------------------------------------------------
+      # Bundle
+      # -------------------------------------------------------------------
+      - name: Preparar bundle
+        shell: msys2 {0}
+        run: |
+          set -euxo pipefail
+      
+          EXE="$(find build -type f -name 'qemu-system-xtensa*.exe' | head -1)"
+          test -f "$EXE"
+          BIN_DIR="$(dirname "$EXE")"
+      
+          mkdir -p bundle
+          cp "$BIN_DIR"/qemu*.exe bundle/
+      
+          mkdir -p bundle/pc-bios
+          cp -rn pc-bios/* bundle/pc-bios/ || true
+      
+          # Copiar todas as DLLs do MinGW64
+          cp -n /mingw64/bin/*.dll bundle/ || true
+
+      # -------------------------------------------------------------------
+      # ZIP
+      # -------------------------------------------------------------------
+      - name: Gerar ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path bundle\* -DestinationPath "${{ env.ZIP_NAME }}"
+
+      # -------------------------------------------------------------------
+      # Upload artifact
+      # -------------------------------------------------------------------
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+
+      # -------------------------------------------------------------------
+      # Tag
+      # -------------------------------------------------------------------
+      - name: Criar tag
+        shell: bash
+        env:
+          TAG_NAME: ${{ inputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag -f "$TAG_NAME"
+          git push -f origin tag "$TAG_NAME"
+
+      # -------------------------------------------------------------------
+      # Release
+      # -------------------------------------------------------------------
+      - name: Criar Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          files: ${{ env.ZIP_NAME }}
+          prerelease: ${{ inputs.prerelease }}
+          body: ${{ inputs.notes }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # -------------------------------------------------------------------
+      # Logs
+      # -------------------------------------------------------------------
+      - name: Mostrar logs em caso de falha
+        if: ${{ failure() }}
+        shell: msys2 {0}
+        run: |
+          echo "===== stderr ====="
+          tail -n 200 build/_ci_logs/_ci_stderr.log || true
+          echo "===== stdout ====="
+          tail -n 200 build/_ci_logs/_ci_stdout.log || true
