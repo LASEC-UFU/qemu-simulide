@@ -29,7 +29,13 @@
 #include "sysemu/sysemu.h"
 #include "sysemu/cpu-timers.h"
 #include "hw/irq.h"
+
+#ifdef CONFIG_ARM
 #include "hw/arm/stm32.h"
+#else
+static void stm32_uart_action(void) {}
+static void stm32_gpio_in_action(void) {}
+#endif
 
 // ------------------------------------------------
 // -------- ARENA ---------------------------------

@@ -36,7 +36,7 @@ out_fobj = sys.stdout
 
 def out_open(filename):
     global out_filename, out_fobj
-    out_filename = filename
+    out_filename = filename.replace('\\', '/')
     out_fobj = open(filename, 'wt')
 
 def out(*lines, **kwargs):

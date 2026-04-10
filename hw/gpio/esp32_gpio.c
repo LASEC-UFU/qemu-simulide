@@ -66,7 +66,7 @@ static void readInput( Esp32GpioState *gpioS, int n )
 
     m_arena->data8 = n;
     m_arena->data32 = *gpioIn;
-    m_arena->action = ESP_GPIO_IN;
+    m_arena->simuAction = ESP_GPIO_IN;
     doAction();
 
     uint32_t changedMask = m_arena->mask32;
@@ -150,7 +150,7 @@ static void outChanged( uint32_t state )
 
     //printf("gpioChanged %i %i %lu %lu\n", pin, state, newState, qemuTime ); fflush( stdout );
 
-    m_arena->action = ESP_GPIO_OUT;
+    m_arena->simuAction = ESP_GPIO_OUT;
     m_arena->data32 = state;
 
     doAction();
@@ -160,7 +160,7 @@ static void dirChanged( uint32_t dir )
 {
     if( !m_arena->running ) return;
 //printf("dirChanged %i %lu\n", dir, qemuTime ); fflush( stdout );
-    m_arena->action = ESP_GPIO_DIR;
+    m_arena->simuAction = ESP_GPIO_DIR;
     m_arena->data32 = dir;
     doAction();
 }
@@ -176,7 +176,7 @@ static void matrixChanged( int out, int func, int value )
 
     if( !m_arena->running ) return;
 
-    m_arena->action = out ? ESP_MATRIX_OUT : ESP_MATRIX_IN;
+    m_arena->simuAction = out ? ESP_MATRIX_OUT : ESP_MATRIX_IN;
     m_arena->data32 = value;
     m_arena->data8  = func;
     doAction();
